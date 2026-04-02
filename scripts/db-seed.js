@@ -111,11 +111,7 @@ function splitSqlStatements(sql) {
 }
 
 function shouldSkipStatement(stmt) {
-  const normalized = stmt
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toUpperCase();
-
+  const normalized = stmt.replace(/\s+/g, ' ').trim().toUpperCase();
   return normalized.startsWith('USE ');
 }
 
