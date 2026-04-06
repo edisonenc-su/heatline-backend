@@ -12,6 +12,18 @@ module.exports = {
   deviceSharedToken: process.env.DEVICE_SHARED_TOKEN || 'change-this-device-token',
   autoProxyDeviceCommands: String(process.env.AUTO_PROXY_DEVICE_COMMANDS || 'true').toLowerCase() === 'true',
   requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS || 5000),
+
+  // KMA / Weather automation
+  kmaAuthKey: process.env.KMA_AUTH_KEY || '',
+  weatherAutoEnabled: String(process.env.WEATHER_AUTO_ENABLED || 'true').toLowerCase() === 'true',
+  weatherAutoIntervalMs: Number(process.env.WEATHER_AUTO_INTERVAL_MS || 10 * 60 * 1000),
+  weatherAutoMonths: process.env.WEATHER_AUTO_MONTHS || '11,12,1,2,3',
+  weatherAutoLeadMinutes: Number(process.env.WEATHER_AUTO_LEAD_MINUTES || 60),
+  weatherAutoHoldMinutes: Number(process.env.WEATHER_AUTO_HOLD_MINUTES || 30),
+  weatherAutoMinTemp: Number(process.env.WEATHER_AUTO_MIN_TEMP || 1),
+  weatherAutoTriggerPty: process.env.WEATHER_AUTO_TRIGGER_PTY || '2,3,6,7',
+  weatherAutoRequireAutoMode: String(process.env.WEATHER_AUTO_REQUIRE_AUTO_MODE || 'true').toLowerCase() === 'true',
+
   db: {
     host: process.env.DB_HOST || '127.0.0.1',
     port: Number(process.env.DB_PORT || 3306),
