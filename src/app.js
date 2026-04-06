@@ -8,6 +8,7 @@ const authRoutes = require('./routes/auth');
 const customerRoutes = require('./routes/customers');
 const userRoutes = require('./routes/users');
 const controllerRoutes = require('./routes/controllers');
+const deviceProvisionRoutes = require('./routes/device-provision');
 const logRoutes = require('./routes/logs');
 
 const app = express();
@@ -21,18 +22,24 @@ app.get('/', (req, res) => {
   return success(res, {
     name: env.appName,
     ok: true,
-    version: '1.0.0'
+    version: '1.1.0'
   });
 });
 
 app.get('/api/v1/health', (req, res) => {
-  return success(res, { ok: true });
+  return success(res, {
+    ok: true,
+    auto_provision: true,
+    allow_legacy_shared_device_token: env.allowLegacySharedDeviceToken,
+    provision_key_ttl_minutes: env.deviceProvisionKeyTtlMinutes
+  });
 });
 
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/customers', customerRoutes);
 app.use('/api/v1/users', userRoutes);
 app.use('/api/v1/controllers', controllerRoutes);
+app.use('/api/v1/device-provision', deviceProvisionRoutes);
 app.use('/api/v1', logRoutes);
 
 app.use((req, res) => fail(res, 404, '요청한 API를 찾을 수 없습니다.', 'NOT_FOUND'));

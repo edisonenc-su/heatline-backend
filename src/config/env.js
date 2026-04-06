@@ -10,6 +10,8 @@ module.exports = {
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || '7d',
   corsOrigin: process.env.CORS_ORIGIN || '*',
   deviceSharedToken: process.env.DEVICE_SHARED_TOKEN || 'change-this-device-token',
+  allowLegacySharedDeviceToken: String(process.env.ALLOW_LEGACY_SHARED_DEVICE_TOKEN || 'true').toLowerCase() === 'true',
+  deviceProvisionKeyTtlMinutes: Number(process.env.DEVICE_PROVISION_KEY_TTL_MINUTES || 30),
   autoProxyDeviceCommands: String(process.env.AUTO_PROXY_DEVICE_COMMANDS || 'true').toLowerCase() === 'true',
   requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS || 5000),
 

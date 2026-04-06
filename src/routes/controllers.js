@@ -1,7 +1,14 @@
-const express = require('express');
 const env = require('../config/env');
+const express = require('express');
 const db = require('../config/db');
-const { requireAuth, requireAdmin, requireDeviceToken, canAccessCustomer } = require('../middleware/auth');
+const {
+  requireAuth,
+  requireAdmin,
+  requireControllerDeviceAuth,
+  canAccessCustomer,
+  hashOpaqueToken,
+  issueOpaqueToken
+} = require('../middleware/auth');
 const { success, fail, asyncHandler } = require('../utils/http');
 
 const router = express.Router();
@@ -33,7 +40,19 @@ function normalizeController(row) {
     note: row.note,
     created_at: row.created_at,
     updated_at: row.updated_at,
-    customer_name: row.customer_name || undefined
+    customer_name: row.customer_name || undefined,
+    pairing_status: row.pairing_status || 'pending',
+    provision_key_issued_at: row.provision_key_issued_at,
+    provision_key_expires_at: row.provision_key_expires_at,
+    provisioned_at: row.provisioned_at,
+    last_claimed_at: row.last_claimed_at,
+    last_claim_ip: row.last_claim_ip,
+    firmware_version: row.firmware_version,
+    hardware_model: row.hardware_model,
+    stream_type: row.stream_type,
+    public_base_url: row.public_base_url,
+    has_device_sync_token: Boolean(row.device_sync_token_hash),
+    has_pending_provision_key: Boolean(row.provision_key_hash)
   };
 }
 
@@ -116,7 +135,6 @@ async function proxyCommandToDevice(controller, body, authUser) {
   });
 
   const data = await response.json().catch(() => ({}));
-
   if (!response.ok || data.success === false) {
     const msg = data?.error?.message || data?.message || `장비 프록시 오류 (${response.status})`;
     throw new Error(msg);
@@ -131,7 +149,7 @@ async function proxyCommandToDevice(controller, body, authUser) {
 }
 
 router.get('/', requireAuth, asyncHandler(async (req, res) => {
-  const { status, customer_id, q } = req.query;
+  const { status, customer_id, q, pairing_status } = req.query;
   const where = [];
   const params = [];
 
@@ -146,6 +164,11 @@ router.get('/', requireAuth, asyncHandler(async (req, res) => {
   if (status) {
     where.push('c.status = ?');
     params.push(status);
+  }
+
+  if (pairing_status) {
+    where.push('c.pairing_status = ?');
+    params.push(pairing_status);
   }
 
   if (q) {
@@ -182,13 +205,17 @@ router.post('/', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
     heater_mode = 'auto',
     snow_threshold = 0.8,
     camera_url = null,
-    device_api_base,
+    device_api_base = null,
     allow_customer_control = true,
     as_expire_at = null,
-    note = ''
+    note = '',
+    firmware_version = null,
+    hardware_model = null,
+    stream_type = 'mjpeg',
+    public_base_url = null
   } = req.body || {};
 
-  if (!customer_id || !controller_name || !serial_no || !install_address || !install_location || !device_api_base) {
+  if (!customer_id || !controller_name || !serial_no || !install_address || !install_location) {
     return fail(res, 400, '필수 항목이 누락되었습니다.', 'VALIDATION_ERROR');
   }
 
@@ -197,25 +224,61 @@ router.post('/', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
     return fail(res, 409, '이미 등록된 시리얼 번호입니다.', 'DUPLICATE_SERIAL');
   }
 
+  const pairingStatus = device_api_base ? 'claimed' : 'pending';
   const result = await db.query(
     `INSERT INTO controllers (
       customer_id, controller_name, serial_no, install_address, install_location,
       latitude, longitude, installed_at, as_expire_at,
       status, snow_detected, heater_on, temperature, humidity,
       heater_mode, snow_threshold, camera_url, device_api_base,
-      allow_customer_control, last_seen_at, note
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+      allow_customer_control, last_seen_at, note,
+      pairing_status, firmware_version, hardware_model, stream_type, public_base_url
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
     [
       customer_id, controller_name, serial_no, install_address, install_location,
       latitude, longitude, as_expire_at,
       status, snow_detected ? 1 : 0, heater_on ? 1 : 0, temperature, humidity,
       heater_mode, snow_threshold, camera_url, device_api_base,
-      allow_customer_control ? 1 : 0, note
+      allow_customer_control ? 1 : 0, note,
+      pairingStatus, firmware_version, hardware_model, stream_type, public_base_url
     ]
   );
 
   const created = await loadControllerOrFail(result.insertId);
   return success(res, normalizeController(created), {}, 201);
+}));
+
+router.post('/:id/provision-key', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  const row = await loadControllerOrFail(id);
+  if (!row) return fail(res, 404, '장비를 찾을 수 없습니다.', 'CONTROLLER_NOT_FOUND');
+
+  const ttlMinutes = Math.max(1, Math.min(Number(req.body?.ttl_minutes || env.deviceProvisionKeyTtlMinutes || 30), 24 * 60));
+  const provisionKey = issueOpaqueToken(`prov${id}`);
+  const provisionKeyHash = hashOpaqueToken(provisionKey);
+
+  await db.query(
+    `UPDATE controllers
+        SET provision_key_hash = ?,
+            provision_key_issued_at = CURRENT_TIMESTAMP,
+            provision_key_expires_at = DATE_ADD(CURRENT_TIMESTAMP, INTERVAL ? MINUTE),
+            pairing_status = 'pending',
+            updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?`,
+    [provisionKeyHash, ttlMinutes, id]
+  );
+
+  const updated = await loadControllerOrFail(id);
+  return success(res, {
+    controller_id: updated.id,
+    serial_no: updated.serial_no,
+    provision_key: provisionKey,
+    pairing_status: updated.pairing_status,
+    provision_key_issued_at: updated.provision_key_issued_at,
+    provision_key_expires_at: updated.provision_key_expires_at
+  }, {
+    message: '프로비전 키가 발급되었습니다. Pi 설정에 즉시 입력한 뒤 claim 하세요.'
+  });
 }));
 
 router.get('/:id', requireAuth, ensureControllerAccess, asyncHandler(async (req, res) => {
@@ -234,14 +297,19 @@ router.put('/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
     longitude = null,
     as_expire_at = null,
     camera_url = null,
-    device_api_base,
+    device_api_base = null,
     heater_mode = 'auto',
     snow_threshold = 0.8,
     allow_customer_control = true,
-    note = ''
+    note = '',
+    pairing_status = null,
+    firmware_version = null,
+    hardware_model = null,
+    stream_type = 'mjpeg',
+    public_base_url = null
   } = req.body || {};
 
-  if (!customer_id || !controller_name || !serial_no || !install_address || !install_location || !device_api_base) {
+  if (!customer_id || !controller_name || !serial_no || !install_address || !install_location) {
     return fail(res, 400, '필수 항목이 누락되었습니다.', 'VALIDATION_ERROR');
   }
 
@@ -252,11 +320,49 @@ router.put('/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
 
   await db.query(
     `UPDATE controllers
-        SET customer_id = ?, controller_name = ?, serial_no = ?, install_address = ?, install_location = ?,
-            latitude = ?, longitude = ?, as_expire_at = ?, camera_url = ?, device_api_base = ?,
-            heater_mode = ?, snow_threshold = ?, allow_customer_control = ?, note = ?, updated_at = CURRENT_TIMESTAMP
+        SET customer_id = ?,
+            controller_name = ?,
+            serial_no = ?,
+            install_address = ?,
+            install_location = ?,
+            latitude = ?,
+            longitude = ?,
+            as_expire_at = ?,
+            camera_url = ?,
+            device_api_base = ?,
+            heater_mode = ?,
+            snow_threshold = ?,
+            allow_customer_control = ?,
+            note = ?,
+            pairing_status = COALESCE(?, pairing_status),
+            firmware_version = COALESCE(?, firmware_version),
+            hardware_model = COALESCE(?, hardware_model),
+            stream_type = COALESCE(?, stream_type),
+            public_base_url = COALESCE(?, public_base_url),
+            updated_at = CURRENT_TIMESTAMP
       WHERE id = ?`,
-    [customer_id, controller_name, serial_no, install_address, install_location, latitude, longitude, as_expire_at, camera_url, device_api_base, heater_mode, snow_threshold, allow_customer_control ? 1 : 0, note, id]
+    [
+      customer_id,
+      controller_name,
+      serial_no,
+      install_address,
+      install_location,
+      latitude,
+      longitude,
+      as_expire_at,
+      camera_url,
+      device_api_base,
+      heater_mode,
+      snow_threshold,
+      allow_customer_control ? 1 : 0,
+      note,
+      pairing_status,
+      firmware_version,
+      hardware_model,
+      stream_type,
+      public_base_url,
+      id
+    ]
   );
 
   const updated = await loadControllerOrFail(id);
@@ -273,7 +379,7 @@ router.delete('/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) =
   return success(res, { id, deleted: true, controller_name: row.controller_name, serial_no: row.serial_no });
 }));
 
-router.put('/:id/status', requireDeviceToken, asyncHandler(async (req, res) => {
+router.put('/:id/status', requireControllerDeviceAuth(loadControllerOrFail), asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
   const {
     status = 'online',
@@ -285,30 +391,65 @@ router.put('/:id/status', requireDeviceToken, asyncHandler(async (req, res) => {
     snow_threshold = 0.8,
     camera_url = null,
     device_api_base = null,
-    last_seen_at = new Date().toISOString()
+    last_seen_at = new Date().toISOString(),
+    public_base_url = null,
+    stream_type = null,
+    firmware_version = null,
+    hardware_model = null
   } = req.body || {};
 
   await db.query(
     `UPDATE controllers
-        SET status = ?, snow_detected = ?, heater_on = ?, temperature = ?, humidity = ?,
-            heater_mode = ?, snow_threshold = ?, camera_url = COALESCE(?, camera_url),
-            device_api_base = COALESCE(?, device_api_base), last_seen_at = ?, updated_at = CURRENT_TIMESTAMP
+        SET status = ?,
+            snow_detected = ?,
+            heater_on = ?,
+            temperature = ?,
+            humidity = ?,
+            heater_mode = ?,
+            snow_threshold = ?,
+            camera_url = COALESCE(?, camera_url),
+            device_api_base = COALESCE(?, device_api_base),
+            public_base_url = COALESCE(?, public_base_url),
+            stream_type = COALESCE(?, stream_type),
+            firmware_version = COALESCE(?, firmware_version),
+            hardware_model = COALESCE(?, hardware_model),
+            pairing_status = CASE WHEN pairing_status IN ('pending','claimed','error') THEN 'active' ELSE pairing_status END,
+            provisioned_at = COALESCE(provisioned_at, CURRENT_TIMESTAMP),
+            last_seen_at = ?,
+            updated_at = CURRENT_TIMESTAMP
       WHERE id = ?`,
-    [status, snow_detected ? 1 : 0, heater_on ? 1 : 0, temperature, humidity, heater_mode, snow_threshold, camera_url, device_api_base, last_seen_at, id]
+    [
+      status,
+      snow_detected ? 1 : 0,
+      heater_on ? 1 : 0,
+      temperature,
+      humidity,
+      heater_mode,
+      snow_threshold,
+      camera_url,
+      device_api_base,
+      public_base_url,
+      stream_type,
+      firmware_version,
+      hardware_model,
+      last_seen_at,
+      id
+    ]
   );
 
   const row = await loadControllerOrFail(id);
   if (!row) return fail(res, 404, '장비를 찾을 수 없습니다.', 'CONTROLLER_NOT_FOUND');
-
   return success(res, normalizeController(row));
 }));
 
-router.post('/:id/heartbeat', requireDeviceToken, asyncHandler(async (req, res) => {
+router.post('/:id/heartbeat', requireControllerDeviceAuth(loadControllerOrFail), asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
   await db.query(
     `UPDATE controllers
         SET last_seen_at = CURRENT_TIMESTAMP,
             status = COALESCE(?, status),
+            pairing_status = CASE WHEN pairing_status IN ('pending','claimed','error') THEN 'active' ELSE pairing_status END,
+            provisioned_at = COALESCE(provisioned_at, CURRENT_TIMESTAMP),
             updated_at = CURRENT_TIMESTAMP
       WHERE id = ?`,
     [req.body?.status || 'online', id]
@@ -316,7 +457,7 @@ router.post('/:id/heartbeat', requireDeviceToken, asyncHandler(async (req, res) 
   return success(res, { controller_id: id, last_seen_at: new Date().toISOString() });
 }));
 
-router.post('/:id/events', requireDeviceToken, asyncHandler(async (req, res) => {
+router.post('/:id/events', requireControllerDeviceAuth(loadControllerOrFail), asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
   const { event_type, message = '', severity = 'info', payload = null } = req.body || {};
   if (!event_type) {
