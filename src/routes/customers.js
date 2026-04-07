@@ -109,17 +109,28 @@ router.delete('/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) =
     [id]
   );
   const userCount = Number(userCountRows[0]?.count || 0);
+
   if (userCount > 0) {
-    return fail(
-      res,
-      409,
-      `이 고객사에 연결된 사용자 ${userCount}명을 먼저 정리해주세요.`,
-      'CUSTOMER_HAS_USERS'
+    await db.query(
+      `UPDATE users
+          SET customer_id = NULL,
+              updated_at = CURRENT_TIMESTAMP
+        WHERE customer_id = ?`,
+      [id]
     );
   }
 
   await db.query(`DELETE FROM customers WHERE id = ?`, [id]);
-  return success(res, { id, deleted: true, company_name: row.company_name });
+  return success(res, {
+    id,
+    deleted: true,
+    company_name: row.company_name,
+    detached_user_count: userCount
+  }, {
+    message: userCount > 0
+      ? `고객사를 삭제했고 연결된 사용자 ${userCount}명의 고객사 연결을 자동 해제했습니다.`
+      : '고객사를 삭제했습니다.'
+  });
 }));
 
 module.exports = router;
