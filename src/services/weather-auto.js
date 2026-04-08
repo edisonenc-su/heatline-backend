@@ -9,7 +9,9 @@ const GRID_NY = 253;
 const GRID_SIZE = GRID_NX * GRID_NY;
 const GRID_RESOLUTION_KM = 5;
 const KMA_GRID_CACHE_TTL_MS = 5 * 60 * 1000;
-const KMA_GRID_REQUEST_CONCURRENCY = 8;
+const KMA_GRID_REQUEST_CONCURRENCY = 3;
+const KMA_FETCH_RETRIES = 2;
+const KMA_RETRY_DELAY_MS = 400;
 const kmaGridCache = new Map();
 
 let schedulerTimer = null;
@@ -255,10 +257,12 @@ function ceilToHour(date = new Date()) {
   return new Date(Math.ceil(date.getTime() / (60 * 60 * 1000)) * 60 * 60 * 1000);
 }
 
-function buildHourlyTargets(now = new Date(), hours = 72) {
+function buildHourlyTargets(now = new Date(), hours = 72, stepHours = 1) {
+  const safeStepHours = Math.max(1, Number(stepHours) || 1);
   const start = ceilToHour(now);
-  return Array.from({ length: Math.max(0, hours) + 1 }, (_, index) => (
-    new Date(start.getTime() + index * 60 * 60 * 1000)
+  const count = Math.floor(Math.max(0, hours) / safeStepHours) + 1;
+  return Array.from({ length: count }, (_, index) => (
+    new Date(start.getTime() + index * safeStepHours * 60 * 60 * 1000)
   ));
 }
 
@@ -308,34 +312,47 @@ async function fetchTextFromKma(pathname, query) {
       authKey: env.kmaAuthKey
     }).toString();
 
-    const response = await fetch(url, {
-      method: 'GET',
-      signal: AbortSignal.timeout(env.requestTimeoutMs + 5000)
-    });
-
-    const text = await response.text();
-    if (!response.ok) {
-      throw new Error(extractKmaErrorMessage(text, response.status));
-    }
-
-    const trimmed = String(text || '').trim();
-    if (trimmed.startsWith('{')) {
+    let lastError = null;
+    for (let attempt = 0; attempt <= KMA_FETCH_RETRIES; attempt += 1) {
       try {
-        const parsed = JSON.parse(trimmed);
-        const resultStatus = Number(parsed?.result?.status || 200);
-        if (resultStatus >= 400) {
-          throw new Error(extractKmaErrorMessage(text, resultStatus));
+        const response = await fetch(url, {
+          method: 'GET',
+          signal: AbortSignal.timeout(env.requestTimeoutMs + 5000)
+        });
+
+        const text = await response.text();
+        if (!response.ok) {
+          throw new Error(extractKmaErrorMessage(text, response.status));
         }
+
+        const trimmed = String(text || '').trim();
+        if (trimmed.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            const resultStatus = Number(parsed?.result?.status || 200);
+            if (resultStatus >= 400) {
+              throw new Error(extractKmaErrorMessage(text, resultStatus));
+            }
+          } catch (error) {
+            if (error instanceof SyntaxError) {
+              // 성공 응답이 우연히 JSON이 아닌 경우는 아래 원문을 그대로 사용
+            } else {
+              throw error;
+            }
+          }
+        }
+
+        return text;
       } catch (error) {
-        if (error instanceof SyntaxError) {
-          // 성공 응답이 우연히 JSON이 아닌 경우는 아래 원문을 그대로 사용
-        } else {
-          throw error;
-        }
+        lastError = error;
+        const message = String(error?.message || '');
+        const retryable = error?.name === 'AbortError' || /timeout/i.test(message);
+        if (!retryable || attempt >= KMA_FETCH_RETRIES) break;
+        await new Promise((resolve) => setTimeout(resolve, KMA_RETRY_DELAY_MS * (attempt + 1)));
       }
     }
 
-    return text;
+    throw lastError || new Error('KMA API 호출 실패');
   })();
 
   kmaGridCache.set(cacheKey, {
@@ -645,6 +662,7 @@ async function resolveGridIfNeeded(controller) {
 async function fetchShortGridForecast(nx, ny, options = {}) {
   const now = options.now || new Date();
   const hours = Number.isFinite(options.hours) ? Number(options.hours) : 72;
+  const stepHours = Number.isFinite(options.stepHours) ? Number(options.stepHours) : 1;
   const includeSky = Boolean(options.includeSky);
   const includePop = Boolean(options.includePop);
   const includeRain = Boolean(options.includeRain);
@@ -657,7 +675,7 @@ async function fetchShortGridForecast(nx, ny, options = {}) {
   const uniqueVars = Array.from(new Set(vars));
   const { base_date, base_time } = getLatestVillageBase(now);
   const tmfc = `${base_date}${base_time.slice(0, 2)}`;
-  const targets = buildHourlyTargets(now, hours);
+  const targets = buildHourlyTargets(now, hours, stepHours);
   const valuesByTime = new Map();
   const taskFactories = [];
 
@@ -879,7 +897,8 @@ async function getControllerWeatherSummary(controller) {
   try {
     const { nx, ny, timeline } = await getControllerForecastTimeline(controller, {
       now: new Date(),
-      hours: 72,
+      hours: 48,
+      stepHours: 3,
       includeSky: true,
       includePop: true,
       includeRain: true
@@ -1114,7 +1133,8 @@ async function processController(controller) {
 
     const { timeline } = await getControllerForecastTimeline(controller, {
       now,
-      hours: 72
+      hours: 18,
+      stepHours: 1
     });
     const triggerPty = parseTriggerPty(controller.weather_trigger_pty);
     const minTemp = Number(controller.weather_min_temp ?? 3);
