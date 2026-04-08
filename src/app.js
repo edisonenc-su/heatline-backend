@@ -8,6 +8,7 @@ const authRoutes = require('./routes/auth');
 const customerRoutes = require('./routes/customers');
 const userRoutes = require('./routes/users');
 const controllerRoutes = require('./routes/controllers');
+const manualScheduleRoutes = require('./routes/manual-schedules');
 const deviceProvisionRoutes = require('./routes/device-provision');
 const logRoutes = require('./routes/logs');
 
@@ -39,6 +40,7 @@ app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/customers', customerRoutes);
 app.use('/api/v1/users', userRoutes);
 app.use('/api/v1/controllers', controllerRoutes);
+app.use('/api/v1', manualScheduleRoutes);
 app.use('/api/v1/device-provision', deviceProvisionRoutes);
 app.use('/api/v1', logRoutes);
 

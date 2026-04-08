@@ -46,7 +46,11 @@ CREATE TABLE IF NOT EXISTS controllers (
   heater_on TINYINT(1) NOT NULL DEFAULT 0,
   temperature DECIMAL(5, 2) NULL,
   humidity DECIMAL(5, 2) NULL,
-  heater_mode ENUM('auto', 'manual') NOT NULL DEFAULT 'auto',
+  heater_mode ENUM('auto', 'manual', 'schedule') NOT NULL DEFAULT 'auto',
+  offline_mode TINYINT(1) NOT NULL DEFAULT 0,
+  current_control_source VARCHAR(40) NULL DEFAULT 'idle',
+  active_schedule_name VARCHAR(120) NULL,
+  last_schedule_sync_at DATETIME NULL,
   snow_threshold DECIMAL(4, 2) NOT NULL DEFAULT 0.80,
   camera_url VARCHAR(255) NULL,
   device_api_base VARCHAR(255) NULL,
@@ -126,5 +130,33 @@ CREATE TABLE IF NOT EXISTS commands (
   KEY idx_commands_controller_id (controller_id),
   KEY idx_commands_created_at (created_at),
   CONSTRAINT fk_commands_controller FOREIGN KEY (controller_id) REFERENCES controllers (id)
+    ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS manual_schedules (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  controller_id BIGINT UNSIGNED NOT NULL,
+  name VARCHAR(120) NOT NULL,
+  schedule_type ENUM('weekly', 'once') NOT NULL DEFAULT 'weekly',
+  enabled TINYINT(1) NOT NULL DEFAULT 1,
+  days_of_week VARCHAR(32) NULL,
+  start_time CHAR(5) NULL,
+  end_time CHAR(5) NULL,
+  once_started_at DATETIME NULL,
+  once_ended_at DATETIME NULL,
+  preheat_minutes INT NOT NULL DEFAULT 0,
+  priority INT NOT NULL DEFAULT 50,
+  offline_enabled TINYINT(1) NOT NULL DEFAULT 1,
+  min_temperature DECIMAL(5, 2) NULL,
+  max_temperature DECIMAL(5, 2) NULL,
+  source ENUM('central', 'local') NOT NULL DEFAULT 'central',
+  note TEXT NULL,
+  last_synced_at DATETIME NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_manual_schedules_controller_id (controller_id),
+  KEY idx_manual_schedules_enabled (enabled),
+  CONSTRAINT fk_manual_schedules_controller FOREIGN KEY (controller_id) REFERENCES controllers (id)
     ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
