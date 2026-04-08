@@ -4,6 +4,13 @@ const env = require('../config/env');
 const KMA_BASE_URL = 'https://apihub.kma.go.kr';
 const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
 const VILLAGE_BASE_HOURS = [2, 5, 8, 11, 14, 17, 20, 23];
+const GRID_NX = 149;
+const GRID_NY = 253;
+const GRID_SIZE = GRID_NX * GRID_NY;
+const GRID_RESOLUTION_KM = 5;
+const KMA_GRID_CACHE_TTL_MS = 5 * 60 * 1000;
+const KMA_GRID_REQUEST_CONCURRENCY = 8;
+const kmaGridCache = new Map();
 
 let schedulerTimer = null;
 let schedulerRunning = false;
@@ -239,52 +246,221 @@ function getLatestUltraBase(now = new Date()) {
   };
 }
 
-async function fetchJsonFromKma(pathname, query) {
-  if (!env.kmaAuthKey) {
-    throw new Error('KMA_AUTH_KEY 환경변수가 비어 있습니다.');
-  }
+function formatKstHourKey(date = new Date()) {
+  const parts = getKstParts(date);
+  return `${parts.ymd}${String(parts.hour).padStart(2, '0')}`;
+}
 
-  const url = new URL(pathname, KMA_BASE_URL);
+function ceilToHour(date = new Date()) {
+  return new Date(Math.ceil(date.getTime() / (60 * 60 * 1000)) * 60 * 60 * 1000);
+}
+
+function buildHourlyTargets(now = new Date(), hours = 72) {
+  const start = ceilToHour(now);
+  return Array.from({ length: Math.max(0, hours) + 1 }, (_, index) => (
+    new Date(start.getTime() + index * 60 * 60 * 1000)
+  ));
+}
+
+function buildKmaCacheKey(pathname, query) {
   const params = new URLSearchParams({
     ...query,
     authKey: env.kmaAuthKey
   });
-  url.search = params.toString();
-
-  const response = await fetch(url, {
-    method: 'GET',
-    signal: AbortSignal.timeout(env.requestTimeoutMs + 5000)
-  });
-
-  const data = await response.json().catch(() => null);
-  if (!response.ok) {
-    const msg =
-      data?.response?.header?.resultMsg ||
-      data?.result?.message ||
-      `KMA API 오류 (${response.status})`;
-    throw new Error(msg);
-  }
-
-  const resultCode = String(
-    data?.response?.header?.resultCode ??
-    data?.header?.resultCode ??
-    ''
-  );
-
-  if (resultCode && resultCode !== '00' && resultCode !== '0') {
-    const msg =
-      data?.response?.header?.resultMsg ||
-      data?.header?.resultMsg ||
-      'KMA API 응답 오류';
-    throw new Error(msg);
-  }
-
-  return data;
+  params.sort();
+  return `${pathname}?${params.toString()}`;
 }
 
-function getItems(data) {
-  const item = data?.response?.body?.items?.item ?? data?.body?.items?.item ?? [];
-  return Array.isArray(item) ? item : item ? [item] : [];
+function extractKmaErrorMessage(text, status) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return `KMA API 오류 (${status})`;
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    return (
+      parsed?.response?.header?.resultMsg ||
+      parsed?.header?.resultMsg ||
+      parsed?.result?.message ||
+      parsed?.message ||
+      `KMA API 오류 (${status})`
+    );
+  } catch (_) {
+    return trimmed.slice(0, 160) || `KMA API 오류 (${status})`;
+  }
+}
+
+async function fetchTextFromKma(pathname, query) {
+  if (!env.kmaAuthKey) {
+    throw new Error('KMA_AUTH_KEY 환경변수가 비어 있습니다.');
+  }
+
+  const cacheKey = buildKmaCacheKey(pathname, query);
+  const cached = kmaGridCache.get(cacheKey);
+  const nowMs = Date.now();
+  if (cached && cached.expiresAt > nowMs) {
+    return cached.promise;
+  }
+
+  const promise = (async () => {
+    const url = new URL(pathname, KMA_BASE_URL);
+    url.search = new URLSearchParams({
+      ...query,
+      authKey: env.kmaAuthKey
+    }).toString();
+
+    const response = await fetch(url, {
+      method: 'GET',
+      signal: AbortSignal.timeout(env.requestTimeoutMs + 5000)
+    });
+
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(extractKmaErrorMessage(text, response.status));
+    }
+
+    const trimmed = String(text || '').trim();
+    if (trimmed.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        const resultStatus = Number(parsed?.result?.status || 200);
+        if (resultStatus >= 400) {
+          throw new Error(extractKmaErrorMessage(text, resultStatus));
+        }
+      } catch (error) {
+        if (error instanceof SyntaxError) {
+          // 성공 응답이 우연히 JSON이 아닌 경우는 아래 원문을 그대로 사용
+        } else {
+          throw error;
+        }
+      }
+    }
+
+    return text;
+  })();
+
+  kmaGridCache.set(cacheKey, {
+    expiresAt: nowMs + KMA_GRID_CACHE_TTL_MS,
+    promise
+  });
+
+  try {
+    return await promise;
+  } catch (error) {
+    kmaGridCache.delete(cacheKey);
+    throw error;
+  }
+}
+
+function extractGridScalar(text, nx, ny) {
+  const x = Number(nx);
+  const y = Number(ny);
+  if (!Number.isInteger(x) || !Number.isInteger(y) || x < 1 || x > GRID_NX || y < 1 || y > GRID_NY) {
+    throw new Error(`격자 좌표 범위 오류 (${nx}, ${ny})`);
+  }
+
+  const tokens = String(text || '')
+    .trim()
+    .split(/\s*,\s*/)
+    .filter(Boolean);
+
+  if (tokens.length < GRID_SIZE) {
+    throw new Error(`격자 응답 길이 부족 (${tokens.length})`);
+  }
+
+  const index = ((y - 1) * GRID_NX) + (x - 1);
+  const value = Number(tokens[index]);
+  if (!Number.isFinite(value) || value <= -99) return null;
+  return value;
+}
+
+function normalizeForecastScalar(varName, value) {
+  if (value == null) return null;
+  if (varName === 'PTY' || varName === 'SKY') return Math.round(value);
+  if (varName === 'POP') return Math.max(0, Math.round(value));
+  return Number(value.toFixed(1));
+}
+
+function mapTyp01VarToCategory(varName) {
+  return {
+    TMP: 'TMP',
+    PTY: 'PTY',
+    SKY: 'SKY',
+    POP: 'POP',
+    PCP: 'PCP',
+    SNO: 'SNO'
+  }[varName] || varName;
+}
+
+async function runTasksWithConcurrency(taskFactories, limit = KMA_GRID_REQUEST_CONCURRENCY) {
+  if (!taskFactories.length) return [];
+
+  const results = new Array(taskFactories.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const current = nextIndex;
+      nextIndex += 1;
+      if (current >= taskFactories.length) break;
+      results[current] = await taskFactories[current]();
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(limit, taskFactories.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+function convertLonLatToGrid(lon, lat) {
+  const longitude = Number(lon);
+  const latitude = Number(lat);
+  if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) {
+    throw new Error('장비 좌표(latitude, longitude)가 올바르지 않습니다.');
+  }
+
+  const RE = 6371.00877;
+  const SLAT1 = 30.0;
+  const SLAT2 = 60.0;
+  const OLON = 126.0;
+  const OLAT = 38.0;
+  const XO = 43;
+  const YO = 136;
+  const DEGRAD = Math.PI / 180.0;
+
+  const re = RE / GRID_RESOLUTION_KM;
+  const slat1 = SLAT1 * DEGRAD;
+  const slat2 = SLAT2 * DEGRAD;
+  const olon = OLON * DEGRAD;
+  const olat = OLAT * DEGRAD;
+
+  let sn = Math.tan((Math.PI * 0.25) + (slat2 * 0.5)) / Math.tan((Math.PI * 0.25) + (slat1 * 0.5));
+  sn = Math.log(Math.cos(slat1) / Math.cos(slat2)) / Math.log(sn);
+
+  let sf = Math.tan((Math.PI * 0.25) + (slat1 * 0.5));
+  sf = (Math.pow(sf, sn) * Math.cos(slat1)) / sn;
+
+  let ro = Math.tan((Math.PI * 0.25) + (olat * 0.5));
+  ro = (re * sf) / Math.pow(ro, sn);
+
+  let ra = Math.tan((Math.PI * 0.25) + (latitude * DEGRAD * 0.5));
+  ra = (re * sf) / Math.pow(ra, sn);
+
+  let theta = (longitude * DEGRAD) - olon;
+  if (theta > Math.PI) theta -= 2.0 * Math.PI;
+  if (theta < -Math.PI) theta += 2.0 * Math.PI;
+  theta *= sn;
+
+  const nx = Math.floor((ra * Math.sin(theta)) + XO + 0.5);
+  const ny = Math.floor((ro - (ra * Math.cos(theta))) + YO + 0.5);
+
+  if (!Number.isInteger(nx) || !Number.isInteger(ny) || nx < 1 || nx > GRID_NX || ny < 1 || ny > GRID_NY) {
+    throw new Error(`격자 변환 범위 오류 (${nx}, ${ny})`);
+  }
+
+  return { nx, ny };
 }
 
 function parseAmount(value) {
@@ -454,78 +630,84 @@ async function resolveGridIfNeeded(controller) {
     throw new Error('장비 좌표(latitude, longitude)가 없습니다.');
   }
 
-  const url = new URL('/api/typ01/cgi-bin/url/nph-dfs_xy_lonlat', KMA_BASE_URL);
-  url.search = new URLSearchParams({
-    lon: String(controller.longitude),
-    lat: String(controller.latitude),
-    help: '0',
-    authKey: env.kmaAuthKey
-  }).toString();
-
-  const response = await fetch(url, {
-    method: 'GET',
-    signal: AbortSignal.timeout(env.requestTimeoutMs + 5000)
-  });
-
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`격자 변환 실패 (${response.status})`);
-  }
-
-  const match = text.match(/(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(\d+)\s*,\s*(\d+)/);
-  if (!match) {
-    throw new Error(`격자 변환 응답 파싱 실패: ${text.slice(0, 120)}`);
-  }
-
-  const nx = Number(match[3]);
-  const ny = Number(match[4]);
+  const { nx, ny } = convertLonLatToGrid(controller.longitude, controller.latitude);
 
   await updateWeatherState(controller.id, {
     kma_nx: nx,
     kma_ny: ny,
     last_error: null,
-    last_message: `KMA 격자 매핑 완료 (${nx}, ${ny})`
+    last_message: `로컬 DFS 격자 매핑 완료 (${nx}, ${ny})`
   });
 
   return { nx, ny };
 }
 
-async function fetchVillageForecast(nx, ny) {
-  const { base_date, base_time } = getLatestVillageBase();
+async function fetchShortGridForecast(nx, ny, options = {}) {
+  const now = options.now || new Date();
+  const hours = Number.isFinite(options.hours) ? Number(options.hours) : 72;
+  const includeSky = Boolean(options.includeSky);
+  const includePop = Boolean(options.includePop);
+  const includeRain = Boolean(options.includeRain);
 
-  const data = await fetchJsonFromKma(
-    '/api/typ02/openApi/VilageFcstInfoService_2.0/getVilageFcst',
-    {
-      pageNo: '1',
-      numOfRows: '1000',
-      dataType: 'JSON',
-      base_date,
-      base_time,
-      nx: String(nx),
-      ny: String(ny)
+  const vars = ['TMP', 'PTY', 'SNO'];
+  if (includeSky) vars.push('SKY');
+  if (includePop) vars.push('POP');
+  if (includeRain) vars.push('PCP');
+
+  const uniqueVars = Array.from(new Set(vars));
+  const { base_date, base_time } = getLatestVillageBase(now);
+  const tmfc = `${base_date}${base_time.slice(0, 2)}`;
+  const targets = buildHourlyTargets(now, hours);
+  const valuesByTime = new Map();
+  const taskFactories = [];
+
+  for (const varName of uniqueVars) {
+    for (const targetDate of targets) {
+      const tmef = formatKstHourKey(targetDate);
+      taskFactories.push(async () => {
+        const text = await fetchTextFromKma('/api/typ01/cgi-bin/url/nph-dfs_shrt_grd', {
+          tmfc,
+          tmef,
+          vars: varName
+        });
+        const scalar = extractGridScalar(text, nx, ny);
+        if (scalar == null) return;
+
+        const existing = valuesByTime.get(tmef) || {};
+        existing[varName] = normalizeForecastScalar(varName, scalar);
+        valuesByTime.set(tmef, existing);
+      });
     }
-  );
+  }
 
-  return groupForecastItems(getItems(data), 'village');
+  await runTasksWithConcurrency(taskFactories);
+
+  const items = [];
+  for (const targetDate of targets) {
+    const tmef = formatKstHourKey(targetDate);
+    const values = valuesByTime.get(tmef);
+    if (!values) continue;
+
+    const fcstDate = tmef.slice(0, 8);
+    const fcstTime = `${tmef.slice(8, 10)}00`;
+    for (const varName of uniqueVars) {
+      if (values[varName] == null) continue;
+      items.push({
+        fcstDate,
+        fcstTime,
+        category: mapTyp01VarToCategory(varName),
+        fcstValue: values[varName]
+      });
+    }
+  }
+
+  return groupForecastItems(items, 'typ01-short-grid');
 }
 
-async function fetchUltraForecast(nx, ny) {
-  const { base_date, base_time } = getLatestUltraBase();
-
-  const data = await fetchJsonFromKma(
-    '/api/typ02/openApi/VilageFcstInfoService_2.0/getUltraSrtFcst',
-    {
-      pageNo: '1',
-      numOfRows: '1000',
-      dataType: 'JSON',
-      base_date,
-      base_time,
-      nx: String(nx),
-      ny: String(ny)
-    }
-  );
-
-  return groupForecastItems(getItems(data), 'ultra');
+async function getControllerForecastTimeline(controller, options = {}) {
+  const { nx, ny } = await resolveGridIfNeeded(controller);
+  const timeline = await fetchShortGridForecast(nx, ny, options);
+  return { nx, ny, timeline };
 }
 
 const PTY_LABELS = {
@@ -693,37 +875,59 @@ async function loadWeatherStateSummary(controllerId) {
 
 async function getControllerWeatherSummary(controller) {
   const weatherState = await loadWeatherStateSummary(controller.id);
-  const { nx, ny } = await resolveGridIfNeeded(controller);
-  const [village, ultra] = await Promise.all([
-    fetchVillageForecast(nx, ny),
-    fetchUltraForecast(nx, ny).catch(() => [])
-  ]);
 
-  const timeline = mergeForecasts(village, ultra);
-  const now = new Date();
-  const dayKeys = [0, 1, 2].map((offset) => {
-    const d = new Date(now.getTime() + offset * 24 * 60 * 60 * 1000);
-    return getKstDayKey(d);
-  });
+  try {
+    const { nx, ny, timeline } = await getControllerForecastTimeline(controller, {
+      now: new Date(),
+      hours: 72,
+      includeSky: true,
+      includePop: true,
+      includeRain: true
+    });
 
-  const days = dayKeys.map((dayKey, offset) => {
-    const entries = timeline.filter((entry) => getKstDayKey(entry.at) === dayKey);
-    const summary = summarizeForecastDay(entries);
+    const now = new Date();
+    const dayKeys = [0, 1, 2].map((offset) => {
+      const d = new Date(now.getTime() + offset * 24 * 60 * 60 * 1000);
+      return getKstDayKey(d);
+    });
+
+    const days = dayKeys.map((dayKey, offset) => {
+      const entries = timeline.filter((entry) => getKstDayKey(entry.at) === dayKey);
+      const summary = summarizeForecastDay(entries);
+      return {
+        label: formatDayLabel(offset),
+        date: dayKey,
+        ...summary
+      };
+    });
+
     return {
-      label: formatDayLabel(offset),
-      date: dayKey,
-      ...summary
+      controller_id: controller.id,
+      controller_name: controller.controller_name || null,
+      snow_threshold: controller.snow_threshold !== null ? Number(controller.snow_threshold) : null,
+      weather_auto: {
+        ...weatherState,
+        nx,
+        ny,
+        last_error: null
+      },
+      fetched_at: new Date().toISOString(),
+      days
     };
-  });
-
-  return {
-    controller_id: controller.id,
-    controller_name: controller.controller_name || null,
-    snow_threshold: controller.snow_threshold !== null ? Number(controller.snow_threshold) : null,
-    weather_auto: weatherState,
-    fetched_at: new Date().toISOString(),
-    days
-  };
+  } catch (error) {
+    return {
+      controller_id: controller.id,
+      controller_name: controller.controller_name || null,
+      snow_threshold: controller.snow_threshold !== null ? Number(controller.snow_threshold) : null,
+      weather_auto: {
+        ...weatherState,
+        last_error: error.message,
+        last_message: '기상청 단기격자 예보 조회 실패'
+      },
+      fetched_at: new Date().toISOString(),
+      days: []
+    };
+  }
 }
 
 async function insertWeatherEventLog(controllerId, eventType, message, severity = 'info', payload = null) {
@@ -908,14 +1112,10 @@ async function processController(controller) {
       return;
     }
 
-    const { nx, ny } = await resolveGridIfNeeded(controller);
-
-    const [village, ultra] = await Promise.all([
-      fetchVillageForecast(nx, ny),
-      fetchUltraForecast(nx, ny).catch(() => [])
-    ]);
-
-    const timeline = mergeForecasts(village, ultra);
+    const { timeline } = await getControllerForecastTimeline(controller, {
+      now,
+      hours: 72
+    });
     const triggerPty = parseTriggerPty(controller.weather_trigger_pty);
     const minTemp = Number(controller.weather_min_temp ?? 3);
     const nextSnow = findNextSnowWindow(timeline, triggerPty, minTemp, now);
