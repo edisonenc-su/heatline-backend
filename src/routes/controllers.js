@@ -10,6 +10,7 @@ const {
   issueOpaqueToken
 } = require('../middleware/auth');
 const { success, fail, asyncHandler } = require('../utils/http');
+const { getControllerWeatherSummary } = require('../services/weather-auto');
 
 const router = express.Router();
 
@@ -287,6 +288,11 @@ router.post('/:id/provision-key', requireAuth, requireAdmin, asyncHandler(async 
 
 router.get('/:id', requireAuth, ensureControllerAccess, asyncHandler(async (req, res) => {
   return success(res, normalizeController(req.controller));
+}));
+
+router.get('/:id/weather-summary', requireAuth, ensureControllerAccess, asyncHandler(async (req, res) => {
+  const summary = await getControllerWeatherSummary(req.controller);
+  return success(res, summary);
 }));
 
 router.put('/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {

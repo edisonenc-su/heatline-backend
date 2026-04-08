@@ -528,6 +528,204 @@ async function fetchUltraForecast(nx, ny) {
   return groupForecastItems(getItems(data), 'ultra');
 }
 
+const PTY_LABELS = {
+  0: '없음',
+  1: '비',
+  2: '비/눈',
+  3: '눈',
+  4: '소나기',
+  5: '빗방울',
+  6: '빗방울/눈날림',
+  7: '눈날림'
+};
+
+const SKY_LABELS = {
+  1: '맑음',
+  3: '구름많음',
+  4: '흐림'
+};
+
+function formatDayLabel(offset) {
+  return ['오늘', '내일', '모레'][offset] || `${offset}일 후`;
+}
+
+function getKstDayKey(date) {
+  return getKstParts(date).ymd;
+}
+
+function toFixedNumber(value, digits = 1) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Number(n.toFixed(digits)) : null;
+}
+
+function summarizeForecastDay(entries = []) {
+  if (!entries.length) {
+    return {
+      sky: null,
+      sky_label: '-',
+      pty: 0,
+      pty_label: '예보 없음',
+      min_temp: null,
+      max_temp: null,
+      pop: null,
+      snow_cm: null,
+      rain_mm: null,
+      summary_text: '예보 없음',
+      will_snow: false
+    };
+  }
+
+  let chosenPty = 0;
+  let chosenSky = null;
+  let minTemp = null;
+  let maxTemp = null;
+  let pop = null;
+  let snowCm = 0;
+  let rainMm = 0;
+
+  for (const entry of entries) {
+    const raw = entry.raw || {};
+    const pty = Number(entry.pty || raw.PTY || 0);
+    const sky = Number(raw.SKY || 0) || null;
+    const tmp = entry.tmp;
+    const tmx = Number(raw.TMX);
+    const tmn = Number(raw.TMN);
+    const entryPop = Number(raw.POP);
+
+    if (pty > chosenPty) chosenPty = pty;
+    if (sky && chosenSky == null) chosenSky = sky;
+
+    if (tmp !== null && tmp !== undefined && Number.isFinite(Number(tmp))) {
+      const n = Number(tmp);
+      minTemp = minTemp === null ? n : Math.min(minTemp, n);
+      maxTemp = maxTemp === null ? n : Math.max(maxTemp, n);
+    }
+
+    if (Number.isFinite(tmn)) minTemp = minTemp === null ? tmn : Math.min(minTemp, tmn);
+    if (Number.isFinite(tmx)) maxTemp = maxTemp === null ? tmx : Math.max(maxTemp, tmx);
+    if (Number.isFinite(entryPop)) pop = pop === null ? entryPop : Math.max(pop, entryPop);
+
+    snowCm += Number(entry.sno || 0);
+    rainMm += Number(entry.pcp || entry.rn1 || 0);
+  }
+
+  const willSnow = [2, 3, 6, 7].includes(chosenPty) || snowCm > 0;
+  const summaryTextParts = [PTY_LABELS[chosenPty] || '강수 정보'];
+  if (minTemp !== null || maxTemp !== null) {
+    summaryTextParts.push(`최저 ${minTemp !== null ? `${toFixedNumber(minTemp, 1)}°C` : '-'} / 최고 ${maxTemp !== null ? `${toFixedNumber(maxTemp, 1)}°C` : '-'}`);
+  }
+  if (pop !== null) summaryTextParts.push(`강수확률 ${Math.round(pop)}%`);
+  if (snowCm > 0) summaryTextParts.push(`적설 ${toFixedNumber(snowCm, 1)}cm`);
+
+  return {
+    sky: chosenSky,
+    sky_label: SKY_LABELS[chosenSky] || '-',
+    pty: chosenPty,
+    pty_label: PTY_LABELS[chosenPty] || '없음',
+    min_temp: toFixedNumber(minTemp, 1),
+    max_temp: toFixedNumber(maxTemp, 1),
+    pop: pop !== null ? Math.round(pop) : null,
+    snow_cm: snowCm > 0 ? toFixedNumber(snowCm, 1) : 0,
+    rain_mm: rainMm > 0 ? toFixedNumber(rainMm, 1) : 0,
+    summary_text: summaryTextParts.join(' · '),
+    will_snow: willSnow
+  };
+}
+
+async function loadWeatherStateSummary(controllerId) {
+  const rows = await db.query(
+    `SELECT
+       enabled, lead_minutes, hold_minutes, trigger_pty, min_temp,
+       kma_nx, kma_ny, active_event_key, forecast_start_at, forecast_end_at,
+       armed_on_at, armed_off_at, running, heater_started_at, heater_stopped_at,
+       last_checked_at, last_error, last_message
+     FROM weather_auto_state
+     WHERE controller_id = ?
+     LIMIT 1`,
+    [controllerId]
+  );
+
+  const row = rows[0] || null;
+  if (!row) {
+    return {
+      enabled: true,
+      lead_minutes: env.weatherAutoLeadMinutes,
+      hold_minutes: env.weatherAutoHoldMinutes,
+      trigger_pty: env.weatherAutoTriggerPty,
+      min_temp: Number(env.weatherAutoMinTemp),
+      nx: null,
+      ny: null,
+      active_event_key: null,
+      forecast_start_at: null,
+      forecast_end_at: null,
+      armed_on_at: null,
+      armed_off_at: null,
+      running: false,
+      heater_started_at: null,
+      heater_stopped_at: null,
+      last_checked_at: null,
+      last_error: null,
+      last_message: 'weather_auto_state 미생성'
+    };
+  }
+
+  return {
+    enabled: Boolean(row.enabled),
+    lead_minutes: Number(row.lead_minutes),
+    hold_minutes: Number(row.hold_minutes),
+    trigger_pty: row.trigger_pty,
+    min_temp: row.min_temp !== null ? Number(row.min_temp) : null,
+    nx: row.kma_nx !== null ? Number(row.kma_nx) : null,
+    ny: row.kma_ny !== null ? Number(row.kma_ny) : null,
+    active_event_key: row.active_event_key || null,
+    forecast_start_at: row.forecast_start_at || null,
+    forecast_end_at: row.forecast_end_at || null,
+    armed_on_at: row.armed_on_at || null,
+    armed_off_at: row.armed_off_at || null,
+    running: Boolean(row.running),
+    heater_started_at: row.heater_started_at || null,
+    heater_stopped_at: row.heater_stopped_at || null,
+    last_checked_at: row.last_checked_at || null,
+    last_error: row.last_error || null,
+    last_message: row.last_message || null
+  };
+}
+
+async function getControllerWeatherSummary(controller) {
+  const weatherState = await loadWeatherStateSummary(controller.id);
+  const { nx, ny } = await resolveGridIfNeeded(controller);
+  const [village, ultra] = await Promise.all([
+    fetchVillageForecast(nx, ny),
+    fetchUltraForecast(nx, ny).catch(() => [])
+  ]);
+
+  const timeline = mergeForecasts(village, ultra);
+  const now = new Date();
+  const dayKeys = [0, 1, 2].map((offset) => {
+    const d = new Date(now.getTime() + offset * 24 * 60 * 60 * 1000);
+    return getKstDayKey(d);
+  });
+
+  const days = dayKeys.map((dayKey, offset) => {
+    const entries = timeline.filter((entry) => getKstDayKey(entry.at) === dayKey);
+    const summary = summarizeForecastDay(entries);
+    return {
+      label: formatDayLabel(offset),
+      date: dayKey,
+      ...summary
+    };
+  });
+
+  return {
+    controller_id: controller.id,
+    controller_name: controller.controller_name || null,
+    snow_threshold: controller.snow_threshold !== null ? Number(controller.snow_threshold) : null,
+    weather_auto: weatherState,
+    fetched_at: new Date().toISOString(),
+    days
+  };
+}
+
 async function insertWeatherEventLog(controllerId, eventType, message, severity = 'info', payload = null) {
   await db.query(
     `INSERT INTO event_logs (controller_id, event_type, message, severity, payload_json)
@@ -874,5 +1072,6 @@ function stopWeatherAutoScheduler() {
 
 module.exports = {
   startWeatherAutoScheduler,
-  stopWeatherAutoScheduler
+  stopWeatherAutoScheduler,
+  getControllerWeatherSummary
 };
