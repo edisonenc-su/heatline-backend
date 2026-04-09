@@ -10,7 +10,6 @@ const {
   issueOpaqueToken
 } = require('../middleware/auth');
 const { success, fail, asyncHandler } = require('../utils/http');
-const { getControllerWeatherSummary } = require('../services/weather-auto');
 
 const router = express.Router();
 
@@ -129,6 +128,7 @@ async function proxyCommandToDevice(controller, body, authUser) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      Authorization: `Bearer ${env.deviceSharedToken}`,
       'X-User-Role': authUser.role,
       'X-User-Id': String(authUser.user_id),
       'X-User-Name': authUser.full_name || authUser.username || 'unknown',
@@ -288,11 +288,6 @@ router.post('/:id/provision-key', requireAuth, requireAdmin, asyncHandler(async 
 
 router.get('/:id', requireAuth, ensureControllerAccess, asyncHandler(async (req, res) => {
   return success(res, normalizeController(req.controller));
-}));
-
-router.get('/:id/weather-summary', requireAuth, ensureControllerAccess, asyncHandler(async (req, res) => {
-  const summary = await getControllerWeatherSummary(req.controller);
-  return success(res, summary);
 }));
 
 router.put('/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
