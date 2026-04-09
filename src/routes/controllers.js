@@ -131,7 +131,6 @@ async function proxyCommandToDevice(controller, body, authUser) {
       Authorization: `Bearer ${env.deviceSharedToken}`,
       'X-User-Role': authUser.role,
       'X-User-Id': String(authUser.user_id),
-      'X-User-Name': authUser.full_name || authUser.username || 'unknown',
       'X-Customer-Id': String(authUser.customer_id || ''),
       'X-Controller-Serial': controller.serial_no || ''
     },
