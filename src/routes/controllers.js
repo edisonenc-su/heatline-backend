@@ -538,9 +538,26 @@ router.post('/:id/commands', requireAuth, ensureControllerAccess, ensureControll
     [id, command_type, command_value === null ? null : String(command_value), reason, requestedUserId, requestedUserName]
   );
 
+  const proxyRequestedBy = requested_by
+    ? {
+        user_id: requested_by.user_id == null ? null : String(requested_by.user_id),
+        user_name: requested_by.user_name == null ? 'unknown' : String(requested_by.user_name)
+      }
+    : {
+        user_id: requestedUserId == null ? null : String(requestedUserId),
+        user_name: requestedUserName == null ? 'unknown' : String(requestedUserName)
+      };
+
+  const proxyPayload = {
+    command_type,
+    command_value,
+    reason,
+    requested_by: proxyRequestedBy
+  };
+
   let proxyResult;
   try {
-    proxyResult = await proxyCommandToDevice(controller, { command_type, command_value, reason, requested_by }, req.user);
+    proxyResult = await proxyCommandToDevice(controller, proxyPayload, req.user);
     await db.query(
       `UPDATE commands
           SET status = ?, response_message = ?, updated_at = CURRENT_TIMESTAMP
@@ -575,5 +592,6 @@ router.post('/:id/commands', requireAuth, ensureControllerAccess, ensureControll
   const rows = await db.query(`SELECT * FROM commands WHERE id = ? LIMIT 1`, [cmdInsert.insertId]);
   return success(res, rows[0], { message: proxyResult.message }, 201);
 }));
+
 
 module.exports = router;
