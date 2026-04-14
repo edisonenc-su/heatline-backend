@@ -631,11 +631,12 @@ router.post('/:id/commands', requireAuth, ensureControllerAccess, ensureControll
   try {
     proxyResult = await proxyCommandToDevice(controller, proxyPayload, req.user);
     await syncControllerStateFromDevice(id, proxyResult.device_response);
+    const successMessage = String(proxyResult.message || '').slice(0, 240);
     await db.query(
       `UPDATE commands
           SET status = ?, response_message = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?`,
-      [proxyResult.status, proxyResult.message, cmdInsert.insertId]
+      [proxyResult.status, successMessage, cmdInsert.insertId]
     );
 
     await db.query(
@@ -645,21 +646,22 @@ router.post('/:id/commands', requireAuth, ensureControllerAccess, ensureControll
       [id, requestedUserId, requestedUserName, command_type, command_value === null ? null : String(command_value), 'success', proxyResult.message]
     );
   } catch (error) {
+    const failedMessage = String(error.message || '장비 명령 전달 실패').slice(0, 240);
     await db.query(
       `UPDATE commands
           SET status = 'failed', response_message = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?`,
-      [error.message, cmdInsert.insertId]
+      [failedMessage, cmdInsert.insertId]
     );
 
     await db.query(
       `INSERT INTO control_logs (
         controller_id, user_id, user_name, command_type, command_value, result, note, requested_at, finished_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-      [id, requestedUserId, requestedUserName, command_type, command_value === null ? null : String(command_value), 'failed', error.message]
+      [id, requestedUserId, requestedUserName, command_type, command_value === null ? null : String(command_value), 'failed', failedMessage]
     );
 
-    return fail(res, 502, `장비 명령 전달 실패: ${error.message}`, 'DEVICE_PROXY_FAILED');
+    return fail(res, 502, `장비 명령 전달 실패: ${failedMessage}`, 'DEVICE_PROXY_FAILED');
   }
 
   const rows = await db.query(`SELECT * FROM commands WHERE id = ? LIMIT 1`, [cmdInsert.insertId]);
