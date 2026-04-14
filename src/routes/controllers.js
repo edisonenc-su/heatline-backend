@@ -88,8 +88,29 @@ function normalizeControlLog(row) {
   };
 }
 
+function isPrivateOrLocalUrl(url = '') {
+  try {
+    const parsed = new URL(url);
+    const host = String(parsed.hostname || '').toLowerCase();
+    if (!host) return false;
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true;
+    if (host.endsWith('.local')) return true;
+    if (/^127\./.test(host)) return true;
+    if (/^10\./.test(host)) return true;
+    if (/^192\.168\./.test(host)) return true;
+    if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(host)) return true;
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
 function normalizeDeviceApiBaseUrl(controller) {
-  const raw = String(controller?.device_api_base || controller?.public_base_url || '').replace(/\/+$/, '');
+  const rawDeviceApiBase = String(controller?.device_api_base || '').replace(/\/+$/, '');
+  const rawPublicBaseUrl = String(controller?.public_base_url || '').replace(/\/+$/, '');
+  const raw = rawPublicBaseUrl && (!rawDeviceApiBase || isPrivateOrLocalUrl(rawDeviceApiBase))
+    ? rawPublicBaseUrl
+    : (rawDeviceApiBase || rawPublicBaseUrl);
   if (!raw) return '';
   if (/\/api\/v\d+$/i.test(raw)) return raw;
   if (/\/api$/i.test(raw)) return `${raw}/v1`;
