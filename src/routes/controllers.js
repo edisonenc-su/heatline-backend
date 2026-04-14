@@ -88,6 +88,14 @@ function normalizeControlLog(row) {
   };
 }
 
+function normalizeDeviceApiBaseUrl(controller) {
+  const raw = String(controller?.device_api_base || controller?.public_base_url || '').replace(/\/+$/, '');
+  if (!raw) return '';
+  if (/\/api\/v\d+$/i.test(raw)) return raw;
+  if (/\/api$/i.test(raw)) return `${raw}/v1`;
+  return `${raw}/api/v1`;
+}
+
 async function loadControllerOrFail(id) {
   const rows = await db.query(
     `SELECT c.*, cu.company_name AS customer_name
@@ -119,11 +127,12 @@ async function ensureControllerControl(req, res, next) {
 }
 
 async function proxyCommandToDevice(controller, body, authUser) {
-  if (!env.autoProxyDeviceCommands || !controller.device_api_base) {
+  const deviceApiBase = normalizeDeviceApiBaseUrl(controller);
+  if (!env.autoProxyDeviceCommands || !deviceApiBase) {
     return { proxied: false, status: 'queued', message: '장비 프록시가 비활성화되어 명령을 중앙 서버에만 기록했습니다.' };
   }
 
-  const url = `${String(controller.device_api_base).replace(/\/+$/, '')}/commands`;
+  const url = `${deviceApiBase}/commands`;
   const response = await fetch(url, {
     method: 'POST',
     headers: {
