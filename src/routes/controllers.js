@@ -88,71 +88,47 @@ function normalizeControlLog(row) {
   };
 }
 
-function isPrivateOrLocalUrl(url = '') {
-  try {
-    const parsed = new URL(url);
-    const host = String(parsed.hostname || '').toLowerCase();
-    if (!host) return false;
-    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true;
-    if (host.endsWith('.local')) return true;
-    if (/^127\./.test(host)) return true;
-    if (/^10\./.test(host)) return true;
-    if (/^192\.168\./.test(host)) return true;
-    if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(host)) return true;
-    return false;
-  } catch (_) {
-    return false;
+function pad2(value) {
+  return String(value).padStart(2, '0');
+}
+
+function toMySqlDateTime(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return null;
+  return `${date.getUTCFullYear()}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())} ${pad2(date.getUTCHours())}:${pad2(date.getUTCMinutes())}:${pad2(date.getUTCSeconds())}`;
+}
+
+function normalizeDateTimeInput(value, { fallbackNow = false } = {}) {
+  if (value === undefined || value === null || value === '') {
+    return fallbackNow ? toMySqlDateTime(new Date()) : null;
   }
-}
 
-function normalizeDeviceApiBaseUrl(controller) {
-  const rawDeviceApiBase = String(controller?.device_api_base || '').replace(/\/+$/, '');
-  const rawPublicBaseUrl = String(controller?.public_base_url || '').replace(/\/+$/, '');
-  const raw = rawPublicBaseUrl && (!rawDeviceApiBase || isPrivateOrLocalUrl(rawDeviceApiBase))
-    ? rawPublicBaseUrl
-    : (rawDeviceApiBase || rawPublicBaseUrl);
-  if (!raw) return '';
-  if (/\/api\/v\d+$/i.test(raw)) return raw;
-  if (/\/api$/i.test(raw)) return `${raw}/v1`;
-  return `${raw}/api/v1`;
-}
+  if (value instanceof Date) {
+    return toMySqlDateTime(value) || (fallbackNow ? toMySqlDateTime(new Date()) : null);
+  }
 
-async function syncControllerStateFromDevice(controllerId, deviceResponse = {}) {
-  const state = deviceResponse?.data?.state || deviceResponse?.state || null;
-  if (!state || typeof state !== 'object') return;
+  if (typeof value === 'number') {
+    const parsedFromNumber = new Date(value);
+    return toMySqlDateTime(parsedFromNumber) || (fallbackNow ? toMySqlDateTime(new Date()) : null);
+  }
 
-  await db.query(
-    `UPDATE controllers
-        SET status = COALESCE(?, status),
-            heater_on = COALESCE(?, heater_on),
-            heater_mode = COALESCE(?, heater_mode),
-            offline_mode = COALESCE(?, offline_mode),
-            current_control_source = COALESCE(?, current_control_source),
-            active_schedule_name = ?,
-            last_schedule_sync_at = COALESCE(?, last_schedule_sync_at),
-            snow_threshold = COALESCE(?, snow_threshold),
-            temperature = COALESCE(?, temperature),
-            humidity = COALESCE(?, humidity),
-            camera_url = COALESCE(?, camera_url),
-            last_seen_at = COALESCE(?, last_seen_at, CURRENT_TIMESTAMP),
-            updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?`,
-    [
-      state.status || null,
-      typeof state.heater_on === 'boolean' ? (state.heater_on ? 1 : 0) : null,
-      state.heater_mode || null,
-      typeof state.offline_mode === 'boolean' ? (state.offline_mode ? 1 : 0) : null,
-      state.current_control_source || null,
-      state.active_schedule_name ?? null,
-      state.last_schedule_sync_at || null,
-      typeof state.snow_threshold === 'number' ? state.snow_threshold : null,
-      typeof state.temperature === 'number' ? state.temperature : null,
-      typeof state.humidity === 'number' ? state.humidity : null,
-      state.camera_url || null,
-      state.last_seen_at || null,
-      controllerId
-    ]
-  );
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return fallbackNow ? toMySqlDateTime(new Date()) : null;
+
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(trimmed)) {
+      return trimmed;
+    }
+
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+      return `${trimmed} 00:00:00`;
+    }
+
+    const parsedFromString = new Date(trimmed);
+    const normalized = toMySqlDateTime(parsedFromString);
+    if (normalized) return normalized;
+  }
+
+  return fallbackNow ? toMySqlDateTime(new Date()) : null;
 }
 
 async function loadControllerOrFail(id) {
@@ -186,19 +162,18 @@ async function ensureControllerControl(req, res, next) {
 }
 
 async function proxyCommandToDevice(controller, body, authUser) {
-  const deviceApiBase = normalizeDeviceApiBaseUrl(controller);
-  if (!env.autoProxyDeviceCommands || !deviceApiBase) {
+  if (!env.autoProxyDeviceCommands || !controller.device_api_base) {
     return { proxied: false, status: 'queued', message: '장비 프록시가 비활성화되어 명령을 중앙 서버에만 기록했습니다.' };
   }
 
-  const url = `${deviceApiBase}/commands`;
+  const url = `${String(controller.device_api_base).replace(/\/+$/, '')}/commands`;
   const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${env.deviceSharedToken}`,
       'X-User-Role': authUser.role,
       'X-User-Id': String(authUser.user_id),
+      'X-User-Name': authUser.full_name || authUser.username || 'unknown',
       'X-Customer-Id': String(authUser.customer_id || ''),
       'X-Controller-Serial': controller.serial_no || ''
     },
@@ -467,12 +442,15 @@ router.put('/:id/status', requireControllerDeviceAuth(loadControllerOrFail), asy
     snow_threshold = 0.8,
     camera_url = null,
     device_api_base = null,
-    last_seen_at = new Date().toISOString(),
+    last_seen_at = null,
     public_base_url = null,
     stream_type = null,
     firmware_version = null,
     hardware_model = null
   } = req.body || {};
+
+  const normalizedLastSeenAt = normalizeDateTimeInput(last_seen_at, { fallbackNow: true });
+  const normalizedLastScheduleSyncAt = normalizeDateTimeInput(last_schedule_sync_at, { fallbackNow: false });
 
   await db.query(
     `UPDATE controllers
@@ -508,7 +486,7 @@ router.put('/:id/status', requireControllerDeviceAuth(loadControllerOrFail), asy
       offline_mode ? 1 : 0,
       current_control_source,
       active_schedule_name,
-      last_schedule_sync_at,
+      normalizedLastScheduleSyncAt,
       snow_threshold,
       camera_url,
       device_api_base,
@@ -516,7 +494,7 @@ router.put('/:id/status', requireControllerDeviceAuth(loadControllerOrFail), asy
       stream_type,
       firmware_version,
       hardware_model,
-      last_seen_at,
+      normalizedLastSeenAt,
       id
     ]
   );
@@ -595,10 +573,6 @@ router.post('/:id/commands', requireAuth, ensureControllerAccess, ensureControll
   }
 
   const controller = req.controller;
-  if (["HEATER_ON", "HEATER_OFF"].includes(String(command_type)) && String(controller.heater_mode || '').toLowerCase() !== 'manual') {
-    return fail(res, 409, '수동 모드에서만 열선 ON/OFF 명령이 가능합니다.', 'MANUAL_MODE_REQUIRED');
-  }
-
   const requestedUserId = requested_by?.user_id || req.user.user_id;
   const requestedUserName = requested_by?.user_name || req.user.full_name || req.user.username;
 
@@ -610,33 +584,14 @@ router.post('/:id/commands', requireAuth, ensureControllerAccess, ensureControll
     [id, command_type, command_value === null ? null : String(command_value), reason, requestedUserId, requestedUserName]
   );
 
-  const proxyRequestedBy = requested_by
-    ? {
-        user_id: requested_by.user_id == null ? null : String(requested_by.user_id),
-        user_name: requested_by.user_name == null ? 'unknown' : String(requested_by.user_name)
-      }
-    : {
-        user_id: requestedUserId == null ? null : String(requestedUserId),
-        user_name: requestedUserName == null ? 'unknown' : String(requestedUserName)
-      };
-
-  const proxyPayload = {
-    command_type,
-    command_value,
-    reason,
-    requested_by: proxyRequestedBy
-  };
-
   let proxyResult;
   try {
-    proxyResult = await proxyCommandToDevice(controller, proxyPayload, req.user);
-    await syncControllerStateFromDevice(id, proxyResult.device_response);
-    const successMessage = String(proxyResult.message || '').slice(0, 240);
+    proxyResult = await proxyCommandToDevice(controller, { command_type, command_value, reason, requested_by }, req.user);
     await db.query(
       `UPDATE commands
           SET status = ?, response_message = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?`,
-      [proxyResult.status, successMessage, cmdInsert.insertId]
+      [proxyResult.status, proxyResult.message, cmdInsert.insertId]
     );
 
     await db.query(
@@ -646,27 +601,25 @@ router.post('/:id/commands', requireAuth, ensureControllerAccess, ensureControll
       [id, requestedUserId, requestedUserName, command_type, command_value === null ? null : String(command_value), 'success', proxyResult.message]
     );
   } catch (error) {
-    const failedMessage = String(error.message || '장비 명령 전달 실패').slice(0, 240);
     await db.query(
       `UPDATE commands
           SET status = 'failed', response_message = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?`,
-      [failedMessage, cmdInsert.insertId]
+      [error.message, cmdInsert.insertId]
     );
 
     await db.query(
       `INSERT INTO control_logs (
         controller_id, user_id, user_name, command_type, command_value, result, note, requested_at, finished_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-      [id, requestedUserId, requestedUserName, command_type, command_value === null ? null : String(command_value), 'failed', failedMessage]
+      [id, requestedUserId, requestedUserName, command_type, command_value === null ? null : String(command_value), 'failed', error.message]
     );
 
-    return fail(res, 502, `장비 명령 전달 실패: ${failedMessage}`, 'DEVICE_PROXY_FAILED');
+    return fail(res, 502, `장비 명령 전달 실패: ${error.message}`, 'DEVICE_PROXY_FAILED');
   }
 
   const rows = await db.query(`SELECT * FROM commands WHERE id = ? LIMIT 1`, [cmdInsert.insertId]);
   return success(res, rows[0], { message: proxyResult.message }, 201);
 }));
-
 
 module.exports = router;
