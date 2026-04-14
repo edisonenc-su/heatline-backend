@@ -557,6 +557,10 @@ router.post('/:id/commands', requireAuth, ensureControllerAccess, ensureControll
   }
 
   const controller = req.controller;
+  if (["HEATER_ON", "HEATER_OFF"].includes(String(command_type)) && String(controller.heater_mode || '').toLowerCase() !== 'manual') {
+    return fail(res, 409, '수동 모드에서만 열선 ON/OFF 명령이 가능합니다.', 'MANUAL_MODE_REQUIRED');
+  }
+
   const requestedUserId = requested_by?.user_id || req.user.user_id;
   const requestedUserName = requested_by?.user_name || req.user.full_name || req.user.username;
 
