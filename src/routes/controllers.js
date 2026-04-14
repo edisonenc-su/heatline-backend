@@ -117,6 +117,44 @@ function normalizeDeviceApiBaseUrl(controller) {
   return `${raw}/api/v1`;
 }
 
+async function syncControllerStateFromDevice(controllerId, deviceResponse = {}) {
+  const state = deviceResponse?.data?.state || deviceResponse?.state || null;
+  if (!state || typeof state !== 'object') return;
+
+  await db.query(
+    `UPDATE controllers
+        SET status = COALESCE(?, status),
+            heater_on = COALESCE(?, heater_on),
+            heater_mode = COALESCE(?, heater_mode),
+            offline_mode = COALESCE(?, offline_mode),
+            current_control_source = COALESCE(?, current_control_source),
+            active_schedule_name = ?,
+            last_schedule_sync_at = COALESCE(?, last_schedule_sync_at),
+            snow_threshold = COALESCE(?, snow_threshold),
+            temperature = COALESCE(?, temperature),
+            humidity = COALESCE(?, humidity),
+            camera_url = COALESCE(?, camera_url),
+            last_seen_at = COALESCE(?, last_seen_at, CURRENT_TIMESTAMP),
+            updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?`,
+    [
+      state.status || null,
+      typeof state.heater_on === 'boolean' ? (state.heater_on ? 1 : 0) : null,
+      state.heater_mode || null,
+      typeof state.offline_mode === 'boolean' ? (state.offline_mode ? 1 : 0) : null,
+      state.current_control_source || null,
+      state.active_schedule_name ?? null,
+      state.last_schedule_sync_at || null,
+      typeof state.snow_threshold === 'number' ? state.snow_threshold : null,
+      typeof state.temperature === 'number' ? state.temperature : null,
+      typeof state.humidity === 'number' ? state.humidity : null,
+      state.camera_url || null,
+      state.last_seen_at || null,
+      controllerId
+    ]
+  );
+}
+
 async function loadControllerOrFail(id) {
   const rows = await db.query(
     `SELECT c.*, cu.company_name AS customer_name
@@ -592,6 +630,7 @@ router.post('/:id/commands', requireAuth, ensureControllerAccess, ensureControll
   let proxyResult;
   try {
     proxyResult = await proxyCommandToDevice(controller, proxyPayload, req.user);
+    await syncControllerStateFromDevice(id, proxyResult.device_response);
     await db.query(
       `UPDATE commands
           SET status = ?, response_message = ?, updated_at = CURRENT_TIMESTAMP
