@@ -52,7 +52,21 @@ CREATE TABLE IF NOT EXISTS controllers (
   active_schedule_name VARCHAR(120) NULL,
   last_schedule_sync_at DATETIME NULL,
   snow_threshold DECIMAL(4, 2) NOT NULL DEFAULT 0.80,
+
+  -- Legacy alias kept for frontend/detail backward compatibility.
+  -- Must contain browser-playable URL only, never raw rtsp://
   camera_url VARCHAR(255) NULL,
+
+  -- New central-streaming fields
+  playback_url VARCHAR(255) NULL,
+  playback_protocol VARCHAR(30) NULL DEFAULT 'mjpeg',
+  video_source_type ENUM('pi_camera', 'central_rtsp') NOT NULL DEFAULT 'pi_camera',
+  source_rtsp_url VARCHAR(500) NULL,
+  rtsp_transport ENUM('tcp', 'udp') NOT NULL DEFAULT 'tcp',
+  snapshot_url VARCHAR(255) NULL,
+  media_status VARCHAR(40) NULL,
+  media_last_seen_at DATETIME NULL,
+
   device_api_base VARCHAR(255) NULL,
   allow_customer_control TINYINT(1) NOT NULL DEFAULT 1,
   last_seen_at DATETIME NULL,
@@ -66,7 +80,11 @@ CREATE TABLE IF NOT EXISTS controllers (
   last_claim_ip VARCHAR(64) NULL,
   firmware_version VARCHAR(80) NULL,
   hardware_model VARCHAR(120) NULL,
+
+  -- Legacy alias kept for backward compatibility with current code.
+  -- Should mirror playback_protocol.
   stream_type VARCHAR(30) NULL DEFAULT 'mjpeg',
+
   public_base_url VARCHAR(255) NULL,
   device_sync_token_hash VARCHAR(255) NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -76,6 +94,8 @@ CREATE TABLE IF NOT EXISTS controllers (
   KEY idx_controllers_customer_id (customer_id),
   KEY idx_controllers_status (status),
   KEY idx_controllers_pairing_status (pairing_status),
+  KEY idx_controllers_video_source_type (video_source_type),
+  KEY idx_controllers_media_status (media_status),
   CONSTRAINT fk_controllers_customer FOREIGN KEY (customer_id) REFERENCES customers (id)
     ON DELETE RESTRICT ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
