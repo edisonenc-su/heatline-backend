@@ -13,8 +13,110 @@ const { success, fail, asyncHandler } = require('../utils/http');
 
 const router = express.Router();
 
+function safeString(value, fallback = null) {
+  if (value === undefined || value === null) return fallback;
+  const trimmed = String(value).trim();
+  return trimmed ? trimmed : fallback;
+}
+
+function stripTrailingSlash(value = '') {
+  return String(value || '').replace(/\/+$/, '');
+}
+
+function normalizeHttpUrl(value, fallback = null) {
+  const v = safeString(value, null);
+  if (!v) return fallback;
+  if (!/^https?:\/\//i.test(v)) return fallback;
+  return stripTrailingSlash(v);
+}
+
+function normalizeRtspUrl(value, fallback = null) {
+  const v = safeString(value, null);
+  if (!v) return fallback;
+  if (!/^rtsp:\/\//i.test(v)) return fallback;
+  return v;
+}
+
+function inferVideoSourceType(input = {}) {
+  const explicit = safeString(input.video_source_type, null);
+  if (explicit) return explicit;
+  if (normalizeRtspUrl(input.source_rtsp_url) || normalizeRtspUrl(input.input_url)) return 'central_rtsp';
+  return 'pi_camera';
+}
+
+function inferPlaybackProtocol(input = {}) {
+  const explicit = safeString(input.playback_protocol || input.stream_type, null);
+  if (explicit) return explicit;
+  const playbackUrl = String(input.playback_url || input.camera_url || '').toLowerCase();
+  if (playbackUrl.includes('.m3u8')) return 'hls';
+  if (playbackUrl.includes('/webrtc') || playbackUrl.includes('whep')) return 'webrtc';
+  if (playbackUrl.includes('.mjpg') || playbackUrl.includes('/stream')) return 'mjpeg';
+  return inferVideoSourceType(input) === 'central_rtsp' ? 'webrtc' : 'mjpeg';
+}
+
+function stripApiSuffix(url = '') {
+  return String(url || '').replace(/\/api\/v\d+$/i, '');
+}
+
+function buildDerivedPlaybackUrl(input = {}, existing = null) {
+  const explicit = normalizeHttpUrl(input.playback_url || input.camera_url, null);
+  if (explicit) return explicit;
+
+  const sourceType = inferVideoSourceType({ ...(existing || {}), ...(input || {}) });
+  if (sourceType === 'pi_camera') {
+    const base = normalizeHttpUrl(input.device_api_base || existing?.device_api_base, null);
+    if (!base) return normalizeHttpUrl(existing?.playback_url || existing?.camera_url, null);
+    return `${stripApiSuffix(base)}/stream.mjpg`;
+  }
+
+  const mediaBase = normalizeHttpUrl(env.publicMediaBaseUrl || input.public_media_base_url || existing?.public_media_base_url, null);
+  const serial = safeString(input.serial_no || existing?.serial_no, null);
+  const controllerId = input.controller_id || existing?.id || null;
+  if (mediaBase && (serial || controllerId)) {
+    const slug = serial ? String(serial).replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase() : `controller-${controllerId}`;
+    return `${mediaBase}/live/${slug}/index.m3u8`;
+  }
+  return normalizeHttpUrl(existing?.playback_url || existing?.camera_url, null);
+}
+
+function buildVideoState(input = {}, existing = null) {
+  const sourceType = inferVideoSourceType({ ...(existing || {}), ...(input || {}) });
+  const playbackUrl = buildDerivedPlaybackUrl(input, existing);
+  const playbackProtocol = inferPlaybackProtocol({ ...(existing || {}), ...(input || {}), playback_url: playbackUrl });
+  const snapshotUrl = normalizeHttpUrl(input.snapshot_url || existing?.snapshot_url, null);
+
+  return {
+    video_source_type: sourceType,
+    source_rtsp_url: sourceType === 'central_rtsp'
+      ? (normalizeRtspUrl(input.source_rtsp_url, null) || normalizeRtspUrl(input.input_url, null) || normalizeRtspUrl(existing?.source_rtsp_url, null))
+      : null,
+    playback_url: playbackUrl,
+    playback_protocol: playbackProtocol,
+    camera_url: playbackUrl,
+    stream_type: playbackProtocol,
+    rtsp_transport: safeString(input.rtsp_transport || existing?.rtsp_transport, 'tcp') || 'tcp',
+    snapshot_url: snapshotUrl,
+    media_status: safeString(input.media_status || existing?.media_status, null),
+    media_last_seen_at: normalizeDateTimeInput(input.media_last_seen_at || existing?.media_last_seen_at, { fallbackNow: false }),
+    device_api_base: normalizeHttpUrl(input.device_api_base || existing?.device_api_base, null)
+  };
+}
+
+function validateVideoState(video) {
+  if (video.video_source_type === 'pi_camera' && !video.device_api_base) {
+    return 'Pi 카메라 방식은 장비 API Base URL이 필요합니다.';
+  }
+  if (video.video_source_type === 'central_rtsp' && !video.source_rtsp_url) {
+    return '중앙 RTSP 방식은 source_rtsp_url 이 필요합니다.';
+  }
+  return null;
+}
+
 function normalizeController(row) {
   if (!row) return null;
+  const playbackUrl = row.playback_url || row.camera_url || null;
+  const playbackProtocol = row.playback_protocol || row.stream_type || 'mjpeg';
+  const videoSourceType = row.video_source_type || (row.source_rtsp_url ? 'central_rtsp' : 'pi_camera');
   return {
     id: row.id,
     customer_id: row.customer_id,
@@ -37,7 +139,15 @@ function normalizeController(row) {
     active_schedule_name: row.active_schedule_name || null,
     last_schedule_sync_at: row.last_schedule_sync_at,
     snow_threshold: row.snow_threshold !== null ? Number(row.snow_threshold) : null,
-    camera_url: row.camera_url,
+    camera_url: playbackUrl,
+    playback_url: playbackUrl,
+    playback_protocol: playbackProtocol,
+    video_source_type: videoSourceType,
+    source_rtsp_url: row.source_rtsp_url || null,
+    rtsp_transport: row.rtsp_transport || 'tcp',
+    snapshot_url: row.snapshot_url || null,
+    media_status: row.media_status || null,
+    media_last_seen_at: row.media_last_seen_at || null,
     device_api_base: row.device_api_base,
     allow_customer_control: Boolean(row.allow_customer_control),
     last_seen_at: row.last_seen_at,
@@ -53,10 +163,20 @@ function normalizeController(row) {
     last_claim_ip: row.last_claim_ip,
     firmware_version: row.firmware_version,
     hardware_model: row.hardware_model,
-    stream_type: row.stream_type,
+    stream_type: playbackProtocol,
     public_base_url: row.public_base_url,
     has_device_sync_token: Boolean(row.device_sync_token_hash),
-    has_pending_provision_key: Boolean(row.provision_key_hash)
+    has_pending_provision_key: Boolean(row.provision_key_hash),
+    video: {
+      source_type: videoSourceType,
+      source_rtsp_url: row.source_rtsp_url || null,
+      playback_url: playbackUrl,
+      playback_protocol: playbackProtocol,
+      snapshot_url: row.snapshot_url || null,
+      rtsp_transport: row.rtsp_transport || 'tcp',
+      media_status: row.media_status || null,
+      media_last_seen_at: row.media_last_seen_at || null
+    }
   };
 }
 
@@ -195,6 +315,56 @@ async function proxyCommandToDevice(controller, body, authUser) {
   };
 }
 
+router.post('/video/detect', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const body = req.body || {};
+  const video = buildVideoState(body, {
+    id: body.controller_id || null,
+    serial_no: body.serial_no || null,
+    device_api_base: body.device_api_base || null,
+    source_rtsp_url: body.source_rtsp_url || null
+  });
+  const error = validateVideoState({
+    ...video,
+    video_source_type: inferVideoSourceType(body.auto_detect === false ? body : { ...body, video_source_type: undefined })
+  });
+  if (error && body.auto_detect === false) {
+    return fail(res, 400, error, 'VIDEO_VALIDATION_ERROR');
+  }
+
+  const finalType = body.auto_detect === false ? (body.video_source_type || video.video_source_type) : video.video_source_type;
+  const result = {
+    ...video,
+    video_source_type: finalType,
+    message: finalType === 'central_rtsp'
+      ? 'RTSP 입력으로 감지되어 중앙 서버 수신 방식으로 설정됩니다.'
+      : 'HTTP 장비 주소로 감지되어 Pi 카메라/장비 API 방식으로 설정됩니다.'
+  };
+
+  return success(res, result);
+}));
+
+router.post('/video/test', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const body = req.body || {};
+  const video = buildVideoState(body, {
+    id: body.controller_id || null,
+    serial_no: body.serial_no || null,
+    device_api_base: body.device_api_base || null,
+    source_rtsp_url: body.source_rtsp_url || null
+  });
+  const error = validateVideoState({
+    ...video,
+    video_source_type: body.video_source_type || video.video_source_type
+  });
+  if (error) return fail(res, 400, error, 'VIDEO_VALIDATION_ERROR');
+
+  return success(res, {
+    ...video,
+    ok: true,
+    media_status: 'ready',
+    message: '영상 입력 정보 검증이 완료되었습니다. 실제 MediaMTX/FFmpeg 연동 시 이 엔드포인트에 연결 체크를 추가하면 됩니다.'
+  });
+}));
+
 router.get('/', requireAuth, asyncHandler(async (req, res) => {
   const { status, customer_id, q, pairing_status } = req.query;
   const where = [];
@@ -251,14 +421,11 @@ router.post('/', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
     humidity = null,
     heater_mode = 'auto',
     snow_threshold = 0.8,
-    camera_url = null,
-    device_api_base = null,
     allow_customer_control = true,
     as_expire_at = null,
     note = '',
     firmware_version = null,
     hardware_model = null,
-    stream_type = 'mjpeg',
     public_base_url = null
   } = req.body || {};
 
@@ -271,23 +438,35 @@ router.post('/', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
     return fail(res, 409, '이미 등록된 시리얼 번호입니다.', 'DUPLICATE_SERIAL');
   }
 
-  const pairingStatus = device_api_base ? 'claimed' : 'pending';
+  const requestedType = req.body?.auto_detect === false ? req.body?.video_source_type : null;
+  const video = buildVideoState({ ...(req.body || {}), serial_no });
+  if (requestedType) video.video_source_type = requestedType;
+  const videoError = validateVideoState(video);
+  if (videoError) return fail(res, 400, videoError, 'VIDEO_VALIDATION_ERROR');
+
+  const pairingStatus = video.device_api_base ? 'claimed' : 'pending';
   const result = await db.query(
     `INSERT INTO controllers (
       customer_id, controller_name, serial_no, install_address, install_location,
       latitude, longitude, installed_at, as_expire_at,
       status, snow_detected, heater_on, temperature, humidity,
-      heater_mode, snow_threshold, camera_url, device_api_base,
-      allow_customer_control, last_seen_at, note,
+      heater_mode, snow_threshold,
+      camera_url, playback_url, playback_protocol,
+      video_source_type, source_rtsp_url, rtsp_transport, snapshot_url,
+      media_status, media_last_seen_at,
+      device_api_base, allow_customer_control, last_seen_at, note,
       pairing_status, firmware_version, hardware_model, stream_type, public_base_url
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
     [
       customer_id, controller_name, serial_no, install_address, install_location,
       latitude, longitude, as_expire_at,
       status, snow_detected ? 1 : 0, heater_on ? 1 : 0, temperature, humidity,
-      heater_mode, snow_threshold, camera_url, device_api_base,
-      allow_customer_control ? 1 : 0, note,
-      pairingStatus, firmware_version, hardware_model, stream_type, public_base_url
+      heater_mode, snow_threshold,
+      video.camera_url, video.playback_url, video.playback_protocol,
+      video.video_source_type, video.source_rtsp_url, video.rtsp_transport, video.snapshot_url,
+      video.media_status, video.media_last_seen_at,
+      video.device_api_base, allow_customer_control ? 1 : 0, note,
+      pairingStatus, firmware_version, hardware_model, video.stream_type, public_base_url
     ]
   );
 
@@ -343,8 +522,6 @@ router.put('/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
     latitude = null,
     longitude = null,
     as_expire_at = null,
-    camera_url = null,
-    device_api_base = null,
     heater_mode = 'auto',
     snow_threshold = 0.8,
     allow_customer_control = true,
@@ -352,7 +529,6 @@ router.put('/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
     pairing_status = null,
     firmware_version = null,
     hardware_model = null,
-    stream_type = 'mjpeg',
     public_base_url = null
   } = req.body || {};
 
@@ -365,6 +541,15 @@ router.put('/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
     return fail(res, 409, '이미 등록된 시리얼 번호입니다.', 'DUPLICATE_SERIAL');
   }
 
+  const current = await loadControllerOrFail(id);
+  if (!current) return fail(res, 404, '장비를 찾을 수 없습니다.', 'CONTROLLER_NOT_FOUND');
+
+  const requestedType = req.body?.auto_detect === false ? req.body?.video_source_type : null;
+  const video = buildVideoState({ ...(req.body || {}), serial_no, controller_id: id }, current);
+  if (requestedType) video.video_source_type = requestedType;
+  const videoError = validateVideoState(video);
+  if (videoError) return fail(res, 400, videoError, 'VIDEO_VALIDATION_ERROR');
+
   await db.query(
     `UPDATE controllers
         SET customer_id = ?,
@@ -376,6 +561,14 @@ router.put('/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
             longitude = ?,
             as_expire_at = ?,
             camera_url = ?,
+            playback_url = ?,
+            playback_protocol = ?,
+            video_source_type = ?,
+            source_rtsp_url = ?,
+            rtsp_transport = ?,
+            snapshot_url = ?,
+            media_status = ?,
+            media_last_seen_at = ?,
             device_api_base = ?,
             heater_mode = ?,
             snow_threshold = ?,
@@ -397,8 +590,16 @@ router.put('/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
       latitude,
       longitude,
       as_expire_at,
-      camera_url,
-      device_api_base,
+      video.camera_url,
+      video.playback_url,
+      video.playback_protocol,
+      video.video_source_type,
+      video.source_rtsp_url,
+      video.rtsp_transport,
+      video.snapshot_url,
+      video.media_status,
+      video.media_last_seen_at,
+      video.device_api_base,
       heater_mode,
       snow_threshold,
       allow_customer_control ? 1 : 0,
@@ -406,7 +607,7 @@ router.put('/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
       pairing_status,
       firmware_version,
       hardware_model,
-      stream_type,
+      video.stream_type,
       public_base_url,
       id
     ]
@@ -428,6 +629,9 @@ router.delete('/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) =
 
 router.put('/:id/status', requireControllerDeviceAuth(loadControllerOrFail), asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
+  const existing = await loadControllerOrFail(id);
+  if (!existing) return fail(res, 404, '장비를 찾을 수 없습니다.', 'CONTROLLER_NOT_FOUND');
+
   const {
     status = 'online',
     snow_detected = false,
@@ -440,17 +644,32 @@ router.put('/:id/status', requireControllerDeviceAuth(loadControllerOrFail), asy
     active_schedule_name = null,
     last_schedule_sync_at = null,
     snow_threshold = 0.8,
-    camera_url = null,
-    device_api_base = null,
     last_seen_at = null,
     public_base_url = null,
-    stream_type = null,
     firmware_version = null,
-    hardware_model = null
+    hardware_model = null,
+    media_status = null,
+    media_last_seen_at = null
   } = req.body || {};
 
   const normalizedLastSeenAt = normalizeDateTimeInput(last_seen_at, { fallbackNow: true });
   const normalizedLastScheduleSyncAt = normalizeDateTimeInput(last_schedule_sync_at, { fallbackNow: false });
+
+  const allowVideoOverwrite = existing.video_source_type !== 'central_rtsp';
+  const video = allowVideoOverwrite
+    ? buildVideoState({ ...(req.body || {}), controller_id: id, serial_no: existing.serial_no, media_status, media_last_seen_at }, existing)
+    : buildVideoState({
+        camera_url: existing.camera_url,
+        playback_url: existing.playback_url,
+        playback_protocol: existing.playback_protocol,
+        video_source_type: existing.video_source_type,
+        source_rtsp_url: existing.source_rtsp_url,
+        rtsp_transport: existing.rtsp_transport,
+        snapshot_url: existing.snapshot_url,
+        device_api_base: existing.device_api_base,
+        media_status: media_status || existing.media_status,
+        media_last_seen_at: media_last_seen_at || existing.media_last_seen_at
+      }, existing);
 
   await db.query(
     `UPDATE controllers
@@ -465,10 +684,15 @@ router.put('/:id/status', requireControllerDeviceAuth(loadControllerOrFail), asy
             active_schedule_name = ?,
             last_schedule_sync_at = COALESCE(?, last_schedule_sync_at),
             snow_threshold = ?,
-            camera_url = COALESCE(?, camera_url),
-            device_api_base = COALESCE(?, device_api_base),
+            camera_url = ?,
+            playback_url = ?,
+            playback_protocol = ?,
+            snapshot_url = ?,
+            media_status = ?,
+            media_last_seen_at = COALESCE(?, media_last_seen_at),
+            device_api_base = ?,
             public_base_url = COALESCE(?, public_base_url),
-            stream_type = COALESCE(?, stream_type),
+            stream_type = ?,
             firmware_version = COALESCE(?, firmware_version),
             hardware_model = COALESCE(?, hardware_model),
             pairing_status = CASE WHEN pairing_status IN ('pending','claimed','error') THEN 'active' ELSE pairing_status END,
@@ -488,10 +712,15 @@ router.put('/:id/status', requireControllerDeviceAuth(loadControllerOrFail), asy
       active_schedule_name,
       normalizedLastScheduleSyncAt,
       snow_threshold,
-      camera_url,
-      device_api_base,
+      video.camera_url,
+      video.playback_url,
+      video.playback_protocol,
+      video.snapshot_url,
+      video.media_status,
+      video.media_last_seen_at,
+      video.device_api_base,
       public_base_url,
-      stream_type,
+      video.stream_type,
       firmware_version,
       hardware_model,
       normalizedLastSeenAt,
